@@ -5,6 +5,8 @@ cli-proxy-api
 # Configuration
 config.yaml
 .env
+.env.local
+.env*.local
 
 # Generated content
 bin/*
