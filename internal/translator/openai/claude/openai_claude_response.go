@@ -58,6 +58,7 @@ type ToolCallAccumulator struct {
 	ID        string
 	Name      string
 	Arguments strings.Builder
+	Started   bool
 }
 
 // ConvertOpenAIResponseToClaude converts OpenAI streaming response format to Anthropic API format.
@@ -198,7 +199,6 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 
 			toolCalls.ForEach(func(_, toolCall gjson.Result) bool {
 				index := int(toolCall.Get("index").Int())
-				blockIndex := param.toolContentBlockIndex(index)
 
 				// Initialize accumulator if needed
 				if _, exists := param.ToolCallsAccumulator[index]; !exists {
@@ -216,26 +216,50 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 				if function := toolCall.Get("function"); function.Exists() {
 					if name := function.Get("name"); name.Exists() {
 						accumulator.Name = name.String()
-
-						stopThinkingContentBlock(param, &results)
-
-						stopTextContentBlock(param, &results)
-
-						// Send content_block_start for tool_use
-						contentBlockStartJSON := `{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"","name":"","input":{}}}`
-						contentBlockStartJSON, _ = sjson.Set(contentBlockStartJSON, "index", blockIndex)
-						contentBlockStartJSON, _ = sjson.Set(contentBlockStartJSON, "content_block.id", accumulator.ID)
-						contentBlockStartJSON, _ = sjson.Set(contentBlockStartJSON, "content_block.name", accumulator.Name)
-						results = append(results, "event: content_block_start\ndata: "+contentBlockStartJSON+"\n\n")
 					}
 
 					// Handle function arguments
 					if args := function.Get("arguments"); args.Exists() {
 						argsText := args.String()
 						if argsText != "" {
-							accumulator.Arguments.WriteString(argsText)
+							current := accumulator.Arguments.String()
+							// Some upstreams send full argument snapshots instead of incremental deltas.
+							// Prefer appending only the new suffix when possible to avoid duplicated JSON fragments.
+							switch {
+							case current == "":
+								accumulator.Arguments.WriteString(argsText)
+							case strings.HasPrefix(argsText, current):
+								accumulator.Arguments.WriteString(argsText[len(current):])
+							case strings.HasSuffix(current, argsText):
+								// Ignore exact duplicate fragments.
+							default:
+								accumulator.Arguments.WriteString(argsText)
+							}
 						}
 					}
+				}
+
+				// Emit tool_use start exactly once per tool index to avoid duplicated tool executions
+				// when upstream repeats tool_calls frames or re-sends name fields.
+				if accumulator.Name != "" && !accumulator.Started {
+					if strings.TrimSpace(accumulator.ID) == "" {
+						if strings.TrimSpace(param.MessageID) != "" {
+							accumulator.ID = fmt.Sprintf("call_%s_%d", param.MessageID, index)
+						} else {
+							accumulator.ID = fmt.Sprintf("call_%d", index)
+						}
+					}
+					blockIndex := param.toolContentBlockIndex(index)
+
+					stopThinkingContentBlock(param, &results)
+					stopTextContentBlock(param, &results)
+
+					contentBlockStartJSON := `{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"","name":"","input":{}}}`
+					contentBlockStartJSON, _ = sjson.Set(contentBlockStartJSON, "index", blockIndex)
+					contentBlockStartJSON, _ = sjson.Set(contentBlockStartJSON, "content_block.id", accumulator.ID)
+					contentBlockStartJSON, _ = sjson.Set(contentBlockStartJSON, "content_block.name", accumulator.Name)
+					results = append(results, "event: content_block_start\ndata: "+contentBlockStartJSON+"\n\n")
+					accumulator.Started = true
 				}
 
 				return true
@@ -264,6 +288,27 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 		if !param.ContentBlocksStopped {
 			for index := range param.ToolCallsAccumulator {
 				accumulator := param.ToolCallsAccumulator[index]
+				if accumulator == nil {
+					continue
+				}
+				// Ensure a start event exists before closing the tool_use block.
+				if !accumulator.Started && strings.TrimSpace(accumulator.Name) != "" {
+					if strings.TrimSpace(accumulator.ID) == "" {
+						if strings.TrimSpace(param.MessageID) != "" {
+							accumulator.ID = fmt.Sprintf("call_%s_%d", param.MessageID, index)
+						} else {
+							accumulator.ID = fmt.Sprintf("call_%d", index)
+						}
+					}
+					blockIndex := param.toolContentBlockIndex(index)
+					contentBlockStartJSON := `{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"","name":"","input":{}}}`
+					contentBlockStartJSON, _ = sjson.Set(contentBlockStartJSON, "index", blockIndex)
+					contentBlockStartJSON, _ = sjson.Set(contentBlockStartJSON, "content_block.id", accumulator.ID)
+					contentBlockStartJSON, _ = sjson.Set(contentBlockStartJSON, "content_block.name", accumulator.Name)
+					results = append(results, "event: content_block_start\ndata: "+contentBlockStartJSON+"\n\n")
+					accumulator.Started = true
+				}
+
 				blockIndex := param.toolContentBlockIndex(index)
 
 				// Send complete input_json_delta with all accumulated arguments
@@ -332,6 +377,27 @@ func convertOpenAIDoneToAnthropic(param *ConvertOpenAIResponseToAnthropicParams)
 	if !param.ContentBlocksStopped {
 		for index := range param.ToolCallsAccumulator {
 			accumulator := param.ToolCallsAccumulator[index]
+			if accumulator == nil {
+				continue
+			}
+			// Ensure a start event exists before closing the tool_use block.
+			if !accumulator.Started && strings.TrimSpace(accumulator.Name) != "" {
+				if strings.TrimSpace(accumulator.ID) == "" {
+					if strings.TrimSpace(param.MessageID) != "" {
+						accumulator.ID = fmt.Sprintf("call_%s_%d", param.MessageID, index)
+					} else {
+						accumulator.ID = fmt.Sprintf("call_%d", index)
+					}
+				}
+				blockIndex := param.toolContentBlockIndex(index)
+				contentBlockStartJSON := `{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"","name":"","input":{}}}`
+				contentBlockStartJSON, _ = sjson.Set(contentBlockStartJSON, "index", blockIndex)
+				contentBlockStartJSON, _ = sjson.Set(contentBlockStartJSON, "content_block.id", accumulator.ID)
+				contentBlockStartJSON, _ = sjson.Set(contentBlockStartJSON, "content_block.name", accumulator.Name)
+				results = append(results, "event: content_block_start\ndata: "+contentBlockStartJSON+"\n\n")
+				accumulator.Started = true
+			}
+
 			blockIndex := param.toolContentBlockIndex(index)
 
 			if accumulator.Arguments.Len() > 0 {

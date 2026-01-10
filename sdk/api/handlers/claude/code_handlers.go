@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v6/internal/constant"
@@ -199,11 +200,6 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 
 	modelName := gjson.GetBytes(rawJSON, "model").String()
 
-	// Create a cancellable context for the backend client request
-	// This allows proper cleanup and cancellation of ongoing requests
-	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-
-	dataChan, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
 	setSSEHeaders := func() {
 		c.Header("Content-Type", "text/event-stream")
 		c.Header("Cache-Control", "no-cache")
@@ -211,7 +207,52 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 		c.Header("Access-Control-Allow-Origin", "*")
 	}
 
-	// Peek at the first chunk to determine success or failure before setting headers
+	// Create a cancellable context for the backend client request
+	// This allows proper cleanup and cancellation of ongoing requests
+	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	dataChan, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
+
+	// Conservative bootstrap keep-alive: only commit SSE headers if the upstream stalls long enough
+	// that Claude Code clients might time out and retry the request (causing duplicated tool calls).
+	// If the upstream fails fast, we preserve the original error response semantics (non-SSE JSON + status code).
+	const bootstrapSSEAfter = 20 * time.Second
+	const bootstrapKeepAliveInterval = 10 * time.Second
+
+	headersCommitted := false
+
+	commitHeaders := func() {
+		if headersCommitted {
+			return
+		}
+		setSSEHeaders()
+		headersCommitted = true
+	}
+
+	writeTerminalError := func(errMsg *interfaces.ErrorMessage) {
+		if errMsg == nil {
+			return
+		}
+		status := http.StatusInternalServerError
+		if errMsg.StatusCode > 0 {
+			status = errMsg.StatusCode
+		}
+		c.Status(status)
+
+		errorBytes, _ := json.Marshal(h.toClaudeError(errMsg))
+		_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", errorBytes)
+	}
+
+	bootstrapTimer := time.NewTimer(bootstrapSSEAfter)
+	defer bootstrapTimer.Stop()
+
+	var bootstrapKeepAlive *time.Ticker
+	var bootstrapKeepAliveC <-chan time.Time
+	defer func() {
+		if bootstrapKeepAlive != nil {
+			bootstrapKeepAlive.Stop()
+		}
+	}()
+
 	for {
 		select {
 		case <-c.Request.Context().Done():
@@ -219,12 +260,16 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 			return
 		case errMsg, ok := <-errChan:
 			if !ok {
-				// Err channel closed cleanly; wait for data channel.
+				// Err channel closed cleanly; keep waiting for data.
 				errChan = nil
 				continue
 			}
-			// Upstream failed immediately. Return proper error status and JSON.
-			h.WriteErrorResponse(c, errMsg)
+			if headersCommitted {
+				writeTerminalError(errMsg)
+				flusher.Flush()
+			} else {
+				h.WriteErrorResponse(c, errMsg)
+			}
 			if errMsg != nil {
 				cliCancel(errMsg.Error)
 			} else {
@@ -233,15 +278,19 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 			return
 		case chunk, ok := <-dataChan:
 			if !ok {
-				// Stream closed without data? Send DONE or just headers.
-				setSSEHeaders()
-				flusher.Flush()
+				if headersCommitted {
+					flusher.Flush()
+				}
 				cliCancel(nil)
 				return
 			}
 
-			// Success! Set headers now.
-			setSSEHeaders()
+			commitHeaders()
+			if bootstrapKeepAlive != nil {
+				bootstrapKeepAlive.Stop()
+				bootstrapKeepAlive = nil
+				bootstrapKeepAliveC = nil
+			}
 
 			// Write the first chunk
 			if len(chunk) > 0 {
@@ -249,9 +298,22 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 				flusher.Flush()
 			}
 
-			// Continue streaming the rest
+			// Continue streaming the rest.
 			h.forwardClaudeStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan)
 			return
+		case <-bootstrapTimer.C:
+			commitHeaders()
+			writeKeepAliveComment(c)
+			flusher.Flush()
+			if bootstrapKeepAlive == nil && bootstrapKeepAliveInterval > 0 {
+				bootstrapKeepAlive = time.NewTicker(bootstrapKeepAliveInterval)
+				bootstrapKeepAliveC = bootstrapKeepAlive.C
+			}
+		case <-bootstrapKeepAliveC:
+			if headersCommitted {
+				writeKeepAliveComment(c)
+				flusher.Flush()
+			}
 		}
 	}
 }
@@ -278,6 +340,13 @@ func (h *ClaudeCodeAPIHandler) forwardClaudeStream(c *gin.Context, flusher http.
 			_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", errorBytes)
 		},
 	})
+}
+
+func writeKeepAliveComment(c *gin.Context) {
+	if c == nil {
+		return
+	}
+	_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
 }
 
 type claudeErrorDetail struct {
