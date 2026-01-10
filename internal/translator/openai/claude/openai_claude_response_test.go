@@ -179,7 +179,7 @@ func TestConvertOpenAIResponseToClaude_DedupesTextSnapshots(t *testing.T) {
 }
 
 func TestToolUseIDMapping_RewritesToolResultToUpstreamID(t *testing.T) {
-	originalRequest := []byte(`{"stream":true}`)
+	originalRequest := []byte(`{"stream":true,"_seed":"TestToolUseIDMapping_RewritesToolResultToUpstreamID"}`)
 	var param any
 
 	upstreamID := "call_upstream_1"

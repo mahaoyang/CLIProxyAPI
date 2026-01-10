@@ -22,9 +22,10 @@ var (
 
 // ConvertOpenAIResponseToAnthropicParams holds parameters for response conversion
 type ConvertOpenAIResponseToAnthropicParams struct {
-	MessageID string
-	Model     string
-	CreatedAt int64
+	MessageID   string
+	Model       string
+	CreatedAt   int64
+	RequestSeed string
 	// Track running text/thinking content to support upstreams that stream full snapshots
 	// instead of incremental deltas.
 	TextSoFar     string
@@ -82,6 +83,7 @@ func ConvertOpenAIResponseToClaude(_ context.Context, _ string, originalRequestR
 			MessageID:                   "",
 			Model:                       "",
 			CreatedAt:                   0,
+			RequestSeed:                 requestSeedFromPayload(originalRequestRawJSON),
 			TextSoFar:                   "",
 			ThinkingSoFar:               "",
 			ToolCallsAccumulator:        nil,
@@ -257,10 +259,10 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 				if accumulator.Name != "" && !accumulator.Started {
 					if strings.TrimSpace(accumulator.ID) == "" {
 						// Upstream omitted tool_call id; fall back to our stable tool id.
-						accumulator.ID = stableToolUseID(param.MessageID, index)
+						accumulator.ID = stableToolUseID(param.RequestSeed, index)
 					}
 					if strings.TrimSpace(accumulator.StableID) == "" {
-						accumulator.StableID = stableToolUseID(param.MessageID, index)
+						accumulator.StableID = stableToolUseID(param.RequestSeed, index)
 					}
 					registerToolUseIDMapping(accumulator.StableID, accumulator.ID)
 					blockIndex := param.toolContentBlockIndex(index)
@@ -308,10 +310,10 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 				// Ensure a start event exists before closing the tool_use block.
 				if !accumulator.Started && strings.TrimSpace(accumulator.Name) != "" {
 					if strings.TrimSpace(accumulator.ID) == "" {
-						accumulator.ID = stableToolUseID(param.MessageID, index)
+						accumulator.ID = stableToolUseID(param.RequestSeed, index)
 					}
 					if strings.TrimSpace(accumulator.StableID) == "" {
-						accumulator.StableID = stableToolUseID(param.MessageID, index)
+						accumulator.StableID = stableToolUseID(param.RequestSeed, index)
 					}
 					registerToolUseIDMapping(accumulator.StableID, accumulator.ID)
 					blockIndex := param.toolContentBlockIndex(index)
@@ -397,10 +399,10 @@ func convertOpenAIDoneToAnthropic(param *ConvertOpenAIResponseToAnthropicParams)
 			// Ensure a start event exists before closing the tool_use block.
 			if !accumulator.Started && strings.TrimSpace(accumulator.Name) != "" {
 				if strings.TrimSpace(accumulator.ID) == "" {
-					accumulator.ID = stableToolUseID(param.MessageID, index)
+					accumulator.ID = stableToolUseID(param.RequestSeed, index)
 				}
 				if strings.TrimSpace(accumulator.StableID) == "" {
-					accumulator.StableID = stableToolUseID(param.MessageID, index)
+					accumulator.StableID = stableToolUseID(param.RequestSeed, index)
 				}
 				registerToolUseIDMapping(accumulator.StableID, accumulator.ID)
 				blockIndex := param.toolContentBlockIndex(index)

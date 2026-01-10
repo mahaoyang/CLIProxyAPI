@@ -1,9 +1,10 @@
 package claude
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -21,10 +22,19 @@ var (
 	toolIDMapping   = make(map[string]toolIDMappingEntry)
 )
 
-func stableToolUseID(messageID string, toolIndex int) string {
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%s:%d", messageID, toolIndex)))
+func stableToolUseID(seed string, toolIndex int) string {
+	sum := sha256.Sum256([]byte(seed + ":" + strconv.Itoa(toolIndex)))
 	// 24 hex chars keeps IDs short while staying collision-resistant for our usage.
 	return "toolu_" + hex.EncodeToString(sum[:])[:24]
+}
+
+func requestSeedFromPayload(payload []byte) string {
+	trimmed := bytes.TrimSpace(payload)
+	if len(trimmed) == 0 {
+		return "empty"
+	}
+	sum := sha256.Sum256(trimmed)
+	return hex.EncodeToString(sum[:])[:16]
 }
 
 func registerToolUseIDMapping(toolUseID, upstreamID string) {
