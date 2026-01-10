@@ -47,6 +47,11 @@ GEMINI.md
 _bmad/*
 _bmad-output/*
 
+# Local scratch / repro directory (never commit)
+ssfq/
+
+gitignore-stormcheck.txt
+
 # macOS
 .DS_Store
 ._*

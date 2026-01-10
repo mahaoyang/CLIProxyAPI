@@ -141,6 +141,16 @@ func wrapManagementAuth(auth gin.HandlerFunc, prefixes ...string) gin.HandlerFun
 	}
 }
 
+func wrapAuthSkipSuffix(auth gin.HandlerFunc, suffix string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if suffix != "" && strings.HasSuffix(c.Request.URL.Path, suffix) {
+			c.Next()
+			return
+		}
+		auth(c)
+	}
+}
+
 // registerManagementRoutes registers Amp management proxy routes
 // These routes proxy through to the Amp control plane for OAuth, user management, etc.
 // Uses dynamic middleware and proxy getter for hot-reload support.
@@ -279,7 +289,8 @@ func (m *AmpModule) registerProviderAliases(engine *gin.Engine, baseHandler *han
 	// Provider-specific routes under /api/provider/:provider
 	ampProviders := engine.Group("/api/provider")
 	if auth != nil {
-		ampProviders.Use(auth)
+		// Claude Code posts telemetry to `/api/event_logging/batch` without auth; accept it to avoid retries/noise.
+		ampProviders.Use(wrapAuthSkipSuffix(auth, "/api/event_logging/batch"))
 	}
 	// Inject client API key into request context for per-client upstream routing
 	ampProviders.Use(clientAPIKeyMiddleware())
@@ -307,6 +318,10 @@ func (m *AmpModule) registerProviderAliases(engine *gin.Engine, baseHandler *han
 	provider.POST("/chat/completions", fallbackHandler.WrapHandler(openaiHandlers.ChatCompletions))
 	provider.POST("/completions", fallbackHandler.WrapHandler(openaiHandlers.Completions))
 	provider.POST("/responses", fallbackHandler.WrapHandler(openaiResponsesHandlers.Responses))
+	// Claude Code CLI posts non-critical telemetry here; accept it to avoid noisy 404s and retries.
+	provider.POST("/api/event_logging/batch", func(c *gin.Context) {
+		c.Status(204)
+	})
 
 	// /v1 routes (OpenAI/Claude-compatible endpoints)
 	v1Amp := provider.Group("/v1")

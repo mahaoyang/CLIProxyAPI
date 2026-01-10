@@ -221,7 +221,8 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 	defer keepAlive.Stop()
 
 	writeKeepAlive := func() {
-		_, _ = c.Writer.Write([]byte("event: ping\ndata: {\"type\":\"ping\"}\n\n"))
+		// Use an SSE comment for keepalive so clients won't treat it as an Anthropic event.
+		writeKeepAliveComment(c)
 	}
 	writeTerminalError := func(errMsg *interfaces.ErrorMessage) {
 		if errMsg == nil {
@@ -236,7 +237,7 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 		_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", errorBytes)
 	}
 
-	// Always send an initial ping so Claude Code sees immediate progress and won't retry the request.
+	// Send an initial keepalive so Claude Code sees immediate progress and won't retry the request.
 	writeKeepAlive()
 	flusher.Flush()
 

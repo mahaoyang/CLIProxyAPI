@@ -94,3 +94,86 @@ func TestConvertOpenAIResponseToClaude_AccumulatesToolArgumentsOnce(t *testing.T
 		t.Fatalf("expected command to be %q, got %v (partial=%q)", "echo REPRO", args["command"], partial)
 	}
 }
+
+func TestConvertOpenAIResponseToClaude_EmitsMessageDeltaOnDoneWithoutFinishReason(t *testing.T) {
+	originalRequest := []byte(`{"stream":true}`)
+	var param any
+
+	part := `{"id":"chat","object":"chat.completion.chunk","created":1,"model":"glm-4.7","choices":[{"index":0,"delta":{"content":"Hello"}}]}`
+	out1 := ConvertOpenAIResponseToClaude(context.Background(), "", originalRequest, nil, []byte("data: "+part+"\n"), &param)
+	out2 := ConvertOpenAIResponseToClaude(context.Background(), "", originalRequest, nil, []byte("data: [DONE]\n"), &param)
+
+	joined := strings.Join(append(out1, out2...), "")
+	if !strings.Contains(joined, "event: message_delta") {
+		t.Fatalf("expected message_delta before message_stop, got: %q", joined)
+	}
+	if !strings.Contains(joined, "event: message_stop") {
+		t.Fatalf("expected message_stop, got: %q", joined)
+	}
+
+	foundStopReason := ""
+	for _, line := range strings.Split(joined, "\n") {
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &payload); err != nil {
+			continue
+		}
+		if payload["type"] != "message_delta" {
+			continue
+		}
+		delta, _ := payload["delta"].(map[string]any)
+		if delta == nil {
+			continue
+		}
+		if v, ok := delta["stop_reason"].(string); ok {
+			foundStopReason = v
+			break
+		}
+	}
+	if foundStopReason != "end_turn" {
+		t.Fatalf("expected stop_reason %q, got %q (full=%q)", "end_turn", foundStopReason, joined)
+	}
+}
+
+func TestConvertOpenAIResponseToClaude_DedupesTextSnapshots(t *testing.T) {
+	originalRequest := []byte(`{"stream":true}`)
+	var param any
+
+	part1 := `{"id":"chat","object":"chat.completion.chunk","created":1,"model":"glm-4.7","choices":[{"index":0,"delta":{"content":"Hello"}}]}`
+	part2 := `{"id":"chat","object":"chat.completion.chunk","created":1,"model":"glm-4.7","choices":[{"index":0,"delta":{"content":"Hello world"}}]}`
+
+	out1 := ConvertOpenAIResponseToClaude(context.Background(), "", originalRequest, nil, []byte("data: "+part1+"\n"), &param)
+	out2 := ConvertOpenAIResponseToClaude(context.Background(), "", originalRequest, nil, []byte("data: "+part2+"\n"), &param)
+
+	joined := strings.Join(append(out1, out2...), "")
+
+	var deltas []string
+	for _, line := range strings.Split(joined, "\n") {
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &payload); err != nil {
+			continue
+		}
+		if payload["type"] != "content_block_delta" {
+			continue
+		}
+		delta, _ := payload["delta"].(map[string]any)
+		if delta == nil || delta["type"] != "text_delta" {
+			continue
+		}
+		if text, ok := delta["text"].(string); ok {
+			deltas = append(deltas, text)
+		}
+	}
+	got := strings.Join(deltas, "")
+	if got != "Hello world" {
+		t.Fatalf("expected reconstructed text %q, got %q (deltas=%v full=%q)", "Hello world", got, deltas, joined)
+	}
+	if len(deltas) >= 2 && deltas[1] == "Hello world" {
+		t.Fatalf("expected second delta to be a suffix, got full snapshot %q (deltas=%v)", deltas[1], deltas)
+	}
+}

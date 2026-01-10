@@ -25,8 +25,10 @@ type ConvertOpenAIResponseToAnthropicParams struct {
 	MessageID string
 	Model     string
 	CreatedAt int64
-	// Content accumulator for streaming
-	ContentAccumulator strings.Builder
+	// Track running text/thinking content to support upstreams that stream full snapshots
+	// instead of incremental deltas.
+	TextSoFar     string
+	ThinkingSoFar string
 	// Tool calls accumulator for streaming
 	ToolCallsAccumulator map[int]*ToolCallAccumulator
 	// Track if text content block has been started
@@ -79,7 +81,8 @@ func ConvertOpenAIResponseToClaude(_ context.Context, _ string, originalRequestR
 			MessageID:                   "",
 			Model:                       "",
 			CreatedAt:                   0,
-			ContentAccumulator:          strings.Builder{},
+			TextSoFar:                   "",
+			ThinkingSoFar:               "",
 			ToolCallsAccumulator:        nil,
 			TextContentBlockStarted:     false,
 			ThinkingContentBlockStarted: false,
@@ -142,53 +145,58 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 			// Don't send content_block_start for text here - wait for actual content
 		}
 
-		// Handle reasoning content delta
+		// Handle reasoning content delta.
+		// Some upstreams send the full thinking snapshot on every frame; emit only the new suffix.
 		if reasoning := delta.Get("reasoning_content"); reasoning.Exists() {
-			for _, reasoningText := range collectOpenAIReasoningTexts(reasoning) {
-				if reasoningText == "" {
-					continue
-				}
-				stopTextContentBlock(param, &results)
-				if !param.ThinkingContentBlockStarted {
-					if param.ThinkingContentBlockIndex == -1 {
-						param.ThinkingContentBlockIndex = param.NextContentBlockIndex
-						param.NextContentBlockIndex++
+			combined := strings.Join(collectOpenAIReasoningTexts(reasoning), "")
+			if combined != "" {
+				thinkingDelta, nextThinking := computeStreamDelta(param.ThinkingSoFar, combined)
+				param.ThinkingSoFar = nextThinking
+				if thinkingDelta != "" {
+					stopTextContentBlock(param, &results)
+					if !param.ThinkingContentBlockStarted {
+						if param.ThinkingContentBlockIndex == -1 {
+							param.ThinkingContentBlockIndex = param.NextContentBlockIndex
+							param.NextContentBlockIndex++
+						}
+						contentBlockStartJSON := `{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`
+						contentBlockStartJSON, _ = sjson.Set(contentBlockStartJSON, "index", param.ThinkingContentBlockIndex)
+						results = append(results, "event: content_block_start\ndata: "+contentBlockStartJSON+"\n\n")
+						param.ThinkingContentBlockStarted = true
 					}
-					contentBlockStartJSON := `{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`
-					contentBlockStartJSON, _ = sjson.Set(contentBlockStartJSON, "index", param.ThinkingContentBlockIndex)
-					results = append(results, "event: content_block_start\ndata: "+contentBlockStartJSON+"\n\n")
-					param.ThinkingContentBlockStarted = true
-				}
 
-				thinkingDeltaJSON := `{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}`
-				thinkingDeltaJSON, _ = sjson.Set(thinkingDeltaJSON, "index", param.ThinkingContentBlockIndex)
-				thinkingDeltaJSON, _ = sjson.Set(thinkingDeltaJSON, "delta.thinking", reasoningText)
-				results = append(results, "event: content_block_delta\ndata: "+thinkingDeltaJSON+"\n\n")
+					thinkingDeltaJSON := `{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}`
+					thinkingDeltaJSON, _ = sjson.Set(thinkingDeltaJSON, "index", param.ThinkingContentBlockIndex)
+					thinkingDeltaJSON, _ = sjson.Set(thinkingDeltaJSON, "delta.thinking", thinkingDelta)
+					results = append(results, "event: content_block_delta\ndata: "+thinkingDeltaJSON+"\n\n")
+				}
 			}
 		}
 
-		// Handle content delta
+		// Handle content delta.
+		// Some upstreams send the full content snapshot on every frame; emit only the new suffix.
 		if content := delta.Get("content"); content.Exists() && content.String() != "" {
-			// Send content_block_start for text if not already sent
-			if !param.TextContentBlockStarted {
-				stopThinkingContentBlock(param, &results)
-				if param.TextContentBlockIndex == -1 {
-					param.TextContentBlockIndex = param.NextContentBlockIndex
-					param.NextContentBlockIndex++
+			textDelta, nextText := computeStreamDelta(param.TextSoFar, content.String())
+			param.TextSoFar = nextText
+			if textDelta != "" {
+				// Send content_block_start for text if not already sent
+				if !param.TextContentBlockStarted {
+					stopThinkingContentBlock(param, &results)
+					if param.TextContentBlockIndex == -1 {
+						param.TextContentBlockIndex = param.NextContentBlockIndex
+						param.NextContentBlockIndex++
+					}
+					contentBlockStartJSON := `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`
+					contentBlockStartJSON, _ = sjson.Set(contentBlockStartJSON, "index", param.TextContentBlockIndex)
+					results = append(results, "event: content_block_start\ndata: "+contentBlockStartJSON+"\n\n")
+					param.TextContentBlockStarted = true
 				}
-				contentBlockStartJSON := `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`
-				contentBlockStartJSON, _ = sjson.Set(contentBlockStartJSON, "index", param.TextContentBlockIndex)
-				results = append(results, "event: content_block_start\ndata: "+contentBlockStartJSON+"\n\n")
-				param.TextContentBlockStarted = true
+
+				contentDeltaJSON := `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}}`
+				contentDeltaJSON, _ = sjson.Set(contentDeltaJSON, "index", param.TextContentBlockIndex)
+				contentDeltaJSON, _ = sjson.Set(contentDeltaJSON, "delta.text", textDelta)
+				results = append(results, "event: content_block_delta\ndata: "+contentDeltaJSON+"\n\n")
 			}
-
-			contentDeltaJSON := `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}}`
-			contentDeltaJSON, _ = sjson.Set(contentDeltaJSON, "index", param.TextContentBlockIndex)
-			contentDeltaJSON, _ = sjson.Set(contentDeltaJSON, "delta.text", content.String())
-			results = append(results, "event: content_block_delta\ndata: "+contentDeltaJSON+"\n\n")
-
-			// Accumulate content
-			param.ContentAccumulator.WriteString(content.String())
 		}
 
 		// Handle tool calls
@@ -415,10 +423,14 @@ func convertOpenAIDoneToAnthropic(param *ConvertOpenAIResponseToAnthropicParams)
 		param.ContentBlocksStopped = true
 	}
 
-	// If we haven't sent message_delta yet (no usage info was received), send it now
-	if param.FinishReason != "" && !param.MessageDeltaSent {
+	// Ensure message_delta is emitted before message_stop, even if upstream omitted finish_reason/usage.
+	if !param.MessageDeltaSent {
+		stopReason := "end_turn"
+		if param.FinishReason != "" {
+			stopReason = mapOpenAIFinishReasonToAnthropic(param.FinishReason)
+		}
 		messageDeltaJSON := `{"type":"message_delta","delta":{"stop_reason":"","stop_sequence":null}}`
-		messageDeltaJSON, _ = sjson.Set(messageDeltaJSON, "delta.stop_reason", mapOpenAIFinishReasonToAnthropic(param.FinishReason))
+		messageDeltaJSON, _ = sjson.Set(messageDeltaJSON, "delta.stop_reason", stopReason)
 		results = append(results, "event: message_delta\ndata: "+messageDeltaJSON+"\n\n")
 		param.MessageDeltaSent = true
 	}
@@ -589,6 +601,23 @@ func stopTextContentBlock(param *ConvertOpenAIResponseToAnthropicParams, results
 	*results = append(*results, "event: content_block_stop\ndata: "+contentBlockStopJSON+"\n\n")
 	param.TextContentBlockStarted = false
 	param.TextContentBlockIndex = -1
+}
+
+func computeStreamDelta(soFar, incoming string) (delta, next string) {
+	if incoming == "" {
+		return "", soFar
+	}
+	if soFar == "" {
+		return incoming, incoming
+	}
+	switch {
+	case strings.HasPrefix(incoming, soFar):
+		return incoming[len(soFar):], incoming
+	case strings.HasPrefix(soFar, incoming):
+		return "", soFar
+	default:
+		return incoming, soFar + incoming
+	}
 }
 
 // ConvertOpenAIResponseToClaudeNonStream converts a non-streaming OpenAI response to a non-streaming Anthropic response.
