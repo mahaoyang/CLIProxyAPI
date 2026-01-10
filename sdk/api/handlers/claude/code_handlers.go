@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -204,30 +205,24 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 		c.Header("Content-Type", "text/event-stream")
 		c.Header("Cache-Control", "no-cache")
 		c.Header("Connection", "keep-alive")
+		// Hint for Nginx-style proxies to avoid buffering SSE.
+		c.Header("X-Accel-Buffering", "no")
 		c.Header("Access-Control-Allow-Origin", "*")
 	}
 
-	// Create a cancellable context for the backend client request
-	// This allows proper cleanup and cancellation of ongoing requests
-	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	dataChan, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
+	setSSEHeaders()
+	flusher.Flush()
 
-	// Conservative bootstrap keep-alive: only commit SSE headers if the upstream stalls long enough
-	// that Claude Code clients might time out and retry the request (causing duplicated tool calls).
-	// If the upstream fails fast, we preserve the original error response semantics (non-SSE JSON + status code).
-	const bootstrapSSEAfter = 20 * time.Second
-	const bootstrapKeepAliveInterval = 10 * time.Second
-
-	headersCommitted := false
-
-	commitHeaders := func() {
-		if headersCommitted {
-			return
-		}
-		setSSEHeaders()
-		headersCommitted = true
+	keepAliveInterval := handlers.StreamingKeepAliveInterval(h.Cfg)
+	if keepAliveInterval <= 0 {
+		keepAliveInterval = 5 * time.Second
 	}
+	keepAlive := time.NewTicker(keepAliveInterval)
+	defer keepAlive.Stop()
 
+	writeKeepAlive := func() {
+		_, _ = c.Writer.Write([]byte("event: ping\ndata: {\"type\":\"ping\"}\n\n"))
+	}
 	writeTerminalError := func(errMsg *interfaces.ErrorMessage) {
 		if errMsg == nil {
 			return
@@ -237,83 +232,95 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 			status = errMsg.StatusCode
 		}
 		c.Status(status)
-
 		errorBytes, _ := json.Marshal(h.toClaudeError(errMsg))
 		_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", errorBytes)
 	}
 
-	bootstrapTimer := time.NewTimer(bootstrapSSEAfter)
-	defer bootstrapTimer.Stop()
+	// Always send an initial ping so Claude Code sees immediate progress and won't retry the request.
+	writeKeepAlive()
+	flusher.Flush()
 
-	var bootstrapKeepAlive *time.Ticker
-	var bootstrapKeepAliveC <-chan time.Time
-	defer func() {
-		if bootstrapKeepAlive != nil {
-			bootstrapKeepAlive.Stop()
+	idempotencyKey := strings.TrimSpace(c.GetHeader("Idempotency-Key"))
+	authKey := strings.TrimSpace(c.GetHeader("Authorization"))
+	dedupeKey := ""
+	if idempotencyKey != "" {
+		dedupeKey = claudeStreamDedupeKey(authKey, idempotencyKey)
+	}
+
+	if dedupeKey == "" {
+		cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+		defer func() { cliCancel(nil) }()
+		dataChan, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
+		for {
+			select {
+			case <-c.Request.Context().Done():
+				cliCancel(c.Request.Context().Err())
+				return
+			case <-keepAlive.C:
+				writeKeepAlive()
+				flusher.Flush()
+			case errMsg, ok := <-errChan:
+				if !ok {
+					errChan = nil
+					continue
+				}
+				writeTerminalError(errMsg)
+				flusher.Flush()
+				if errMsg != nil {
+					cliCancel(errMsg.Error)
+				}
+				return
+			case chunk, ok := <-dataChan:
+				if !ok {
+					flusher.Flush()
+					return
+				}
+				if len(chunk) > 0 {
+					_, _ = c.Writer.Write(chunk)
+					flusher.Flush()
+				}
+			}
 		}
-	}()
+	}
+
+	stream := globalClaudeStreamHub.getOrCreate(dedupeKey, func(execCtx context.Context) (<-chan []byte, <-chan *interfaces.ErrorMessage) {
+		return h.ExecuteStreamWithAuthManager(execCtx, h.HandlerType(), modelName, rawJSON, "")
+	}, func(errMsg *interfaces.ErrorMessage) []byte {
+		if errMsg == nil {
+			return nil
+		}
+		errorBytes, _ := json.Marshal(h.toClaudeError(errMsg))
+		return []byte(fmt.Sprintf("event: error\ndata: %s\n\n", errorBytes))
+	})
+
+	replay, sub, unsubscribe := stream.subscribe()
+	defer unsubscribe()
+
+	for _, chunk := range replay {
+		if len(chunk) == 0 {
+			continue
+		}
+		_, _ = c.Writer.Write(chunk)
+		flusher.Flush()
+	}
 
 	for {
 		select {
 		case <-c.Request.Context().Done():
-			cliCancel(c.Request.Context().Err())
 			return
-		case errMsg, ok := <-errChan:
+		case <-keepAlive.C:
+			writeKeepAlive()
+			flusher.Flush()
+		case chunk, ok := <-sub:
 			if !ok {
-				// Err channel closed cleanly; keep waiting for data.
-				errChan = nil
-				continue
-			}
-			if headersCommitted {
-				writeTerminalError(errMsg)
 				flusher.Flush()
-			} else {
-				h.WriteErrorResponse(c, errMsg)
-			}
-			if errMsg != nil {
-				cliCancel(errMsg.Error)
-			} else {
-				cliCancel(nil)
-			}
-			return
-		case chunk, ok := <-dataChan:
-			if !ok {
-				if headersCommitted {
-					flusher.Flush()
-				}
-				cliCancel(nil)
 				return
 			}
-
-			commitHeaders()
-			if bootstrapKeepAlive != nil {
-				bootstrapKeepAlive.Stop()
-				bootstrapKeepAlive = nil
-				bootstrapKeepAliveC = nil
+			if len(chunk) == 0 {
+				continue
 			}
-
-			// Write the first chunk
-			if len(chunk) > 0 {
-				_, _ = c.Writer.Write(chunk)
-				flusher.Flush()
-			}
-
-			// Continue streaming the rest.
-			h.forwardClaudeStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan)
-			return
-		case <-bootstrapTimer.C:
-			commitHeaders()
-			writeKeepAliveComment(c)
+			_, _ = c.Writer.Write(chunk)
 			flusher.Flush()
-			if bootstrapKeepAlive == nil && bootstrapKeepAliveInterval > 0 {
-				bootstrapKeepAlive = time.NewTicker(bootstrapKeepAliveInterval)
-				bootstrapKeepAliveC = bootstrapKeepAlive.C
-			}
-		case <-bootstrapKeepAliveC:
-			if headersCommitted {
-				writeKeepAliveComment(c)
-				flusher.Flush()
-			}
 		}
 	}
 }
