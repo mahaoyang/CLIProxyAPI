@@ -149,7 +149,11 @@ func ConvertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 						// Only allow tool_use -> tool_calls for assistant messages (security: prevent injection).
 						if role == "assistant" {
 							toolCallJSON := `{"id":"","type":"function","function":{"name":"","arguments":""}}`
-							toolCallJSON, _ = sjson.Set(toolCallJSON, "id", part.Get("id").String())
+							toolUseID := part.Get("id").String()
+							if mapped, ok := resolveToolUseIDMapping(toolUseID); ok {
+								toolUseID = mapped
+							}
+							toolCallJSON, _ = sjson.Set(toolCallJSON, "id", toolUseID)
 							toolCallJSON, _ = sjson.Set(toolCallJSON, "function.name", part.Get("name").String())
 
 							// Convert input to arguments JSON string
@@ -165,7 +169,11 @@ func ConvertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 					case "tool_result":
 						// Collect tool_result to emit after the main message (ensures tool results follow tool_calls)
 						toolResultJSON := `{"role":"tool","tool_call_id":"","content":""}`
-						toolResultJSON, _ = sjson.Set(toolResultJSON, "tool_call_id", part.Get("tool_use_id").String())
+						toolUseID := part.Get("tool_use_id").String()
+						if mapped, ok := resolveToolUseIDMapping(toolUseID); ok {
+							toolUseID = mapped
+						}
+						toolResultJSON, _ = sjson.Set(toolResultJSON, "tool_call_id", toolUseID)
 						toolResultJSON, _ = sjson.Set(toolResultJSON, "content", convertClaudeToolResultContentToString(part.Get("content")))
 						toolResults = append(toolResults, toolResultJSON)
 					}

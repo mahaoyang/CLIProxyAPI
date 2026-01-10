@@ -58,6 +58,7 @@ type ConvertOpenAIResponseToAnthropicParams struct {
 // ToolCallAccumulator holds the state for accumulating tool call data
 type ToolCallAccumulator struct {
 	ID        string
+	StableID  string
 	Name      string
 	Arguments strings.Builder
 	Started   bool
@@ -217,7 +218,11 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 
 				// Handle tool call ID
 				if id := toolCall.Get("id"); id.Exists() {
-					accumulator.ID = id.String()
+					// Only accept upstream IDs before emitting a tool_use block to avoid
+					// desynchronising tool_result correlation with the client.
+					if !accumulator.Started {
+						accumulator.ID = id.String()
+					}
 				}
 
 				// Handle function name
@@ -251,12 +256,13 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 				// when upstream repeats tool_calls frames or re-sends name fields.
 				if accumulator.Name != "" && !accumulator.Started {
 					if strings.TrimSpace(accumulator.ID) == "" {
-						if strings.TrimSpace(param.MessageID) != "" {
-							accumulator.ID = fmt.Sprintf("call_%s_%d", param.MessageID, index)
-						} else {
-							accumulator.ID = fmt.Sprintf("call_%d", index)
-						}
+						// Upstream omitted tool_call id; fall back to our stable tool id.
+						accumulator.ID = stableToolUseID(param.MessageID, index)
 					}
+					if strings.TrimSpace(accumulator.StableID) == "" {
+						accumulator.StableID = stableToolUseID(param.MessageID, index)
+					}
+					registerToolUseIDMapping(accumulator.StableID, accumulator.ID)
 					blockIndex := param.toolContentBlockIndex(index)
 
 					stopThinkingContentBlock(param, &results)
@@ -264,7 +270,7 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 
 					contentBlockStartJSON := `{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"","name":"","input":{}}}`
 					contentBlockStartJSON, _ = sjson.Set(contentBlockStartJSON, "index", blockIndex)
-					contentBlockStartJSON, _ = sjson.Set(contentBlockStartJSON, "content_block.id", accumulator.ID)
+					contentBlockStartJSON, _ = sjson.Set(contentBlockStartJSON, "content_block.id", accumulator.StableID)
 					contentBlockStartJSON, _ = sjson.Set(contentBlockStartJSON, "content_block.name", accumulator.Name)
 					results = append(results, "event: content_block_start\ndata: "+contentBlockStartJSON+"\n\n")
 					accumulator.Started = true
@@ -302,16 +308,16 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 				// Ensure a start event exists before closing the tool_use block.
 				if !accumulator.Started && strings.TrimSpace(accumulator.Name) != "" {
 					if strings.TrimSpace(accumulator.ID) == "" {
-						if strings.TrimSpace(param.MessageID) != "" {
-							accumulator.ID = fmt.Sprintf("call_%s_%d", param.MessageID, index)
-						} else {
-							accumulator.ID = fmt.Sprintf("call_%d", index)
-						}
+						accumulator.ID = stableToolUseID(param.MessageID, index)
 					}
+					if strings.TrimSpace(accumulator.StableID) == "" {
+						accumulator.StableID = stableToolUseID(param.MessageID, index)
+					}
+					registerToolUseIDMapping(accumulator.StableID, accumulator.ID)
 					blockIndex := param.toolContentBlockIndex(index)
 					contentBlockStartJSON := `{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"","name":"","input":{}}}`
 					contentBlockStartJSON, _ = sjson.Set(contentBlockStartJSON, "index", blockIndex)
-					contentBlockStartJSON, _ = sjson.Set(contentBlockStartJSON, "content_block.id", accumulator.ID)
+					contentBlockStartJSON, _ = sjson.Set(contentBlockStartJSON, "content_block.id", accumulator.StableID)
 					contentBlockStartJSON, _ = sjson.Set(contentBlockStartJSON, "content_block.name", accumulator.Name)
 					results = append(results, "event: content_block_start\ndata: "+contentBlockStartJSON+"\n\n")
 					accumulator.Started = true
@@ -391,16 +397,16 @@ func convertOpenAIDoneToAnthropic(param *ConvertOpenAIResponseToAnthropicParams)
 			// Ensure a start event exists before closing the tool_use block.
 			if !accumulator.Started && strings.TrimSpace(accumulator.Name) != "" {
 				if strings.TrimSpace(accumulator.ID) == "" {
-					if strings.TrimSpace(param.MessageID) != "" {
-						accumulator.ID = fmt.Sprintf("call_%s_%d", param.MessageID, index)
-					} else {
-						accumulator.ID = fmt.Sprintf("call_%d", index)
-					}
+					accumulator.ID = stableToolUseID(param.MessageID, index)
 				}
+				if strings.TrimSpace(accumulator.StableID) == "" {
+					accumulator.StableID = stableToolUseID(param.MessageID, index)
+				}
+				registerToolUseIDMapping(accumulator.StableID, accumulator.ID)
 				blockIndex := param.toolContentBlockIndex(index)
 				contentBlockStartJSON := `{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"","name":"","input":{}}}`
 				contentBlockStartJSON, _ = sjson.Set(contentBlockStartJSON, "index", blockIndex)
-				contentBlockStartJSON, _ = sjson.Set(contentBlockStartJSON, "content_block.id", accumulator.ID)
+				contentBlockStartJSON, _ = sjson.Set(contentBlockStartJSON, "content_block.id", accumulator.StableID)
 				contentBlockStartJSON, _ = sjson.Set(contentBlockStartJSON, "content_block.name", accumulator.Name)
 				results = append(results, "event: content_block_start\ndata: "+contentBlockStartJSON+"\n\n")
 				accumulator.Started = true
