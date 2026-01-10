@@ -7,6 +7,7 @@ package claude
 
 import (
 	"bytes"
+	"encoding/json"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
@@ -271,11 +272,11 @@ func ConvertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 		tools.ForEach(func(_, tool gjson.Result) bool {
 			openAIToolJSON := `{"type":"function","function":{"name":"","description":""}}`
 			openAIToolJSON, _ = sjson.Set(openAIToolJSON, "function.name", tool.Get("name").String())
-			openAIToolJSON, _ = sjson.Set(openAIToolJSON, "function.description", tool.Get("description").String())
+			openAIToolJSON, _ = sjson.Set(openAIToolJSON, "function.description", sanitizeToolDescription(tool.Get("description").String()))
 
 			// Convert Anthropic input_schema to OpenAI function parameters
 			if inputSchema := tool.Get("input_schema"); inputSchema.Exists() {
-				openAIToolJSON, _ = sjson.Set(openAIToolJSON, "function.parameters", inputSchema.Value())
+				openAIToolJSON, _ = sjson.Set(openAIToolJSON, "function.parameters", sanitizeToolSchema(inputSchema.Value()))
 			}
 
 			toolsJSON, _ = sjson.Set(toolsJSON, "-1", gjson.Parse(openAIToolJSON).Value())
@@ -312,6 +313,59 @@ func ConvertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 	}
 
 	return []byte(out)
+}
+
+const maxToolDescriptionBytes = 1024
+
+func sanitizeToolDescription(desc string) string {
+	desc = strings.TrimSpace(desc)
+	if desc == "" {
+		return ""
+	}
+	if len(desc) <= maxToolDescriptionBytes {
+		return desc
+	}
+	return strings.TrimSpace(desc[:maxToolDescriptionBytes]) + "…"
+}
+
+func sanitizeToolSchema(schema any) any {
+	// Best-effort sanitization:
+	// - Drop large non-essential fields ($schema/title/description/examples/default).
+	// - Keep structural fields needed for function calling (type/properties/required/items/enum/oneOf/anyOf/allOf).
+	// - If sanitization fails, return original schema.
+	raw, err := json.Marshal(schema)
+	if err != nil {
+		return schema
+	}
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return schema
+	}
+	return pruneJSONSchema(v)
+}
+
+func pruneJSONSchema(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(t))
+		for k, vv := range t {
+			switch k {
+			case "$schema", "title", "description", "examples", "example", "default":
+				continue
+			default:
+				out[k] = pruneJSONSchema(vv)
+			}
+		}
+		return out
+	case []any:
+		out := make([]any, 0, len(t))
+		for _, vv := range t {
+			out = append(out, pruneJSONSchema(vv))
+		}
+		return out
+	default:
+		return v
+	}
 }
 
 func convertClaudeContentPart(part gjson.Result) (string, bool) {
